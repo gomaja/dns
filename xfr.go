@@ -12,16 +12,22 @@ type Envelope struct {
 	Error error // If something went wrong, this contains the error.
 }
 
+const maxTsigUnsignedMessages = 99 // RFC 8945 §5.3.1
+
 // A Transfer defines parameters that are used during a zone transfer.
 type Transfer struct {
 	*Conn
-	DialTimeout    time.Duration     // net.DialTimeout, defaults to 2 seconds
-	ReadTimeout    time.Duration     // net.Conn.SetReadTimeout value for connections, defaults to 2 seconds
-	WriteTimeout   time.Duration     // net.Conn.SetWriteTimeout value for connections, defaults to 2 seconds
-	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
-	TsigSecret     map[string]string // Secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
-	tsigTimersOnly bool
-	TLS            *tls.Config // TLS config. If Xfr over TLS will be attempted
+	DialTimeout       time.Duration     // net.DialTimeout, defaults to 2 seconds
+	ReadTimeout       time.Duration     // net.Conn.SetReadTimeout value for connections, defaults to 2 seconds
+	WriteTimeout      time.Duration     // net.Conn.SetWriteTimeout value for connections, defaults to 2 seconds
+	TsigProvider      TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
+	TsigSecret        map[string]string // Secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
+	tsigTimersOnly    bool
+	tsigSignedFirst   bool
+	tsigLastMsgSigned bool
+	tsigUnsignedCount int
+	tsigUnsignedBuf   []byte
+	TLS               *tls.Config // TLS config. If Xfr over TLS will be attempted
 }
 
 func (t *Transfer) tsigProvider() TsigProvider {
@@ -68,6 +74,12 @@ func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
 			return nil, err
 		}
 	}
+
+	t.tsigTimersOnly = false
+	t.tsigSignedFirst = false
+	t.tsigLastMsgSigned = false
+	t.tsigUnsignedCount = 0
+	t.tsigUnsignedBuf = nil
 
 	if err := t.WriteMsg(q); err != nil {
 		return nil, err
@@ -129,6 +141,10 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 		if !first {
 			t.tsigTimersOnly = true // Subsequent envelopes use this.
 			if isSOALast(in) {
+				if t.tsigProvider() != nil && !t.tsigLastMsgSigned {
+					c <- &Envelope{nil, ErrNoSig}
+					return
+				}
 				c <- &Envelope{in.Answer, nil}
 				return
 			}
@@ -190,6 +206,10 @@ func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 					n++
 					// quit if it's a full axfr or the servers' SOA is repeated the third time
 					if axfr && n == 2 || n == 3 {
+						if t.tsigProvider() != nil && !t.tsigLastMsgSigned {
+							c <- &Envelope{nil, ErrNoSig}
+							return
+						}
 						c <- &Envelope{in.Answer, nil}
 						return
 					}
@@ -253,9 +273,26 @@ func (t *Transfer) ReadMsg() (*Msg, error) {
 	}
 
 	if tp := t.tsigProvider(); tp != nil {
+		ts := m.IsTsig()
+		if ts == nil {
+			// RFC 8945 §5.3.1: first message MUST contain TSIG; up to 99
+			// intermediary messages may omit TSIG and are digested verbatim
+			// ahead of the next signed message.
+			if !t.tsigSignedFirst || t.tsigUnsignedCount >= maxTsigUnsignedMessages {
+				return m, ErrNoSig
+			}
+			t.tsigUnsignedCount++
+			t.tsigUnsignedBuf = append(t.tsigUnsignedBuf, p...)
+			t.tsigLastMsgSigned = false
+			return m, nil
+		}
 		// Need to work on the original message p, as that was used to calculate the tsig.
-		err = TsigVerifyWithProvider(p, tp, t.tsigRequestMAC, t.tsigTimersOnly)
-		if ts := m.IsTsig(); ts != nil {
+		err = tsigVerifyWithPrefix(t.tsigUnsignedBuf, p, tp, t.tsigRequestMAC, t.tsigTimersOnly, uint64(time.Now().Unix()))
+		if err == nil {
+			t.tsigSignedFirst = true
+			t.tsigLastMsgSigned = true
+			t.tsigUnsignedCount = 0
+			t.tsigUnsignedBuf = nil
 			t.tsigRequestMAC = ts.MAC
 		}
 	}

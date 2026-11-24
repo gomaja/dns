@@ -648,6 +648,9 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 	case MsgReject, MsgRejectNotImplemented:
 		opcode := req.Opcode
 		req.SetRcodeFormatError(req)
+		req.Truncated = false
+		req.RecursionAvailable = false
+		req.AuthenticatedData = false
 		req.Zero = false
 		if action == MsgRejectNotImplemented {
 			req.Opcode = opcode

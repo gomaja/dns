@@ -229,13 +229,19 @@ func TsigVerifyWithProvider(msg []byte, provider TsigProvider, requestMAC string
 
 // actual implementation of TsigVerify, taking the current time ('now') as a parameter for the convenience of tests.
 func tsigVerify(msg []byte, provider TsigProvider, requestMAC string, timersOnly bool, now uint64) error {
+	return tsigVerifyWithPrefix(nil, msg, provider, requestMAC, timersOnly, now)
+}
+
+// tsigVerifyWithPrefix verifies a TSIG over Prior MAC || unsignedPrefix || stripped(msg) || TSIG vars/timers
+// per RFC 8945 §5.3.1 for multi-message TCP responses containing unsigned intermediate messages.
+func tsigVerifyWithPrefix(unsignedPrefix, msg []byte, provider TsigProvider, requestMAC string, timersOnly bool, now uint64) error {
 	// Strip the TSIG from the incoming msg
 	stripped, tsig, err := stripTsig(msg)
 	if err != nil {
 		return err
 	}
 
-	buf, err := tsigBuffer(stripped, tsig, requestMAC, timersOnly)
+	buf, err := tsigBufferWithPrefix(unsignedPrefix, stripped, tsig, requestMAC, timersOnly)
 	if err != nil {
 		return err
 	}
@@ -261,6 +267,10 @@ func tsigVerify(msg []byte, provider TsigProvider, requestMAC string, timersOnly
 
 // Create a wiredata buffer for the MAC calculation.
 func tsigBuffer(msgbuf []byte, rr *TSIG, requestMAC string, timersOnly bool) ([]byte, error) {
+	return tsigBufferWithPrefix(nil, msgbuf, rr, requestMAC, timersOnly)
+}
+
+func tsigBufferWithPrefix(unsignedPrefix, msgbuf []byte, rr *TSIG, requestMAC string, timersOnly bool) ([]byte, error) {
 	var buf []byte
 	if rr.TimeSigned == 0 {
 		rr.TimeSigned = uint64(time.Now().Unix())
@@ -313,10 +323,13 @@ func tsigBuffer(msgbuf []byte, rr *TSIG, requestMAC string, timersOnly bool) ([]
 	}
 
 	if requestMAC != "" {
-		x := append(buf, msgbuf...)
+		x := append(buf, unsignedPrefix...)
+		x = append(x, msgbuf...)
 		buf = append(x, tsigvar...)
 	} else {
-		buf = append(msgbuf, tsigvar...)
+		x := append([]byte(nil), unsignedPrefix...)
+		x = append(x, msgbuf...)
+		buf = append(x, tsigvar...)
 	}
 	return buf, nil
 }
